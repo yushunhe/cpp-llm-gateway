@@ -1,0 +1,19 @@
+# build artifacts (paths are forced repo-local by CMake, see AGENTS.md)
+build/
+bin/
+lib/*.so
+logs/
+log/*.log
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# rag generated index (rebuild with rag/build_index.py)
+rag/kb/
+
+# editor/os
+.vscode/
+.idea/
+.DS_Store
