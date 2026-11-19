@@ -1,122 +1,105 @@
-# C++项目推荐：kama-webserver | 代码随想录
+# cpp-llm-gateway
 
-**本项目目前只在[知识星球](https://programmercarl.com/other/kstar.html)里维护，并答疑**
+一个用 C++ 手写的**高性能 LLM 推理网关**：底层是基于 epoll 的 Reactor 并发网络框架，对外提供 **OpenAI 兼容的 HTTP 接口**（`/v1/chat/completions`，支持 SSE 流式）和轻量行协议两种入口，推理侧通过可插拔后端对接本地大模型（vLLM / HuggingFace Transformers / Mock），并已接入 LangChain 实现完整的本地 RAG 问答链路。
 
-最近[知识星球](https://programmercarl.com/other/kstar.html)里的项目开启翻新计划，为了应变每年校招求职的变化，很多星球老项目都重构代码并重写项目文档了。
+一句话概括：**客户端把请求发给 C++ 网关，网关把推理请求分发给本地模型守护进程，全程不出本机。**
 
-这期给大家重构的项目是 23年在[知识星球](https://programmercarl.com/other/kstar.html)里发布的webserver项目。
+```
+客户端 / LangChain / 浏览器 UI
+        │  OpenAI 兼容 HTTP (:8080) 或 行协议 TCP
+        ▼
+C++ 网关 (epoll Reactor, one-loop-per-thread)
+        │  行协议 TCP (127.0.0.1:19090)
+        ▼
+model_daemon.py ──▶ vLLM │ Transformers │ Mock
+```
 
-## 老生常淡，webserver还能做吗？
+## 核心特性
 
-关于C++的项目，大家都会知道 webserver。
+**网络框架（C++17 / CMake）**
+- epoll (ET) + Reactor 事件引擎：`EventLoop` / `Channel` / `Poller` / `Acceptor` / `TcpServer` / `TcpConnection`
+- master-slave Reactor：`EventLoopThreadPool`，one loop per thread
+- 通用定时器-wheel：`Timer` + `TimerQueue`，连接空闲超时自动断开
+- 异步日志系统：双缓冲落盘（`AsyncLogging` / `LogFile`），日志滚动
+- 内存池：`memory_lib`，减少高频小块分配的开销
+- 缓存组件：LFU 缓存策略实现
 
-有一个段子：C++选手人均webserver。
+**LLM 网关（本项目扩展）**
+- `POST /v1/chat/completions`：OpenAI 协议兼容，手写零依赖 JSON 解析与序列化
+- `stream: true` SSE 流式返回（`data: [DONE]` 收尾），LangChain `ChatOpenAI` 仅改 `base_url` 即可直连
+- 双协议入口：HTTP 与 `INFER\t` 行协议（供内部组件/调试使用）
+- 推理在独立 worker 队列执行，不阻塞事件循环线程
+- Python 守护进程提供三种可插拔推理后端：
+  - `vllm`：生产级吞吐（8GB 显存可跑 0.5B~3B）
+  - `transformers`：无 vLLM 依赖，CPU/GPU 自适应
+  - `mock`：不加载模型，全链路调试用
 
-我得给webserver“伸冤”一下，其实**webserver是一个非常好的学习项目，只是这个项目的形式“烂大街”了**，它所涉及的知识依然是经典的。
+**RAG 应用层（rag/）**
+- `build_index.py`：文档 → 切块 → sentence-transformers 向量化 → FAISS 入库
+- `ask.py`：问题 → 向量检索 Top-K → 组装 Prompt → 经网关生成（带来源展示）
+- 检索在 Python 侧本地完成，生成走自研网关——网关即"私有 OpenAI"
 
-webserver 所涉及到的知识：
+## 快速开始
 
-* C++八股（C/C++语法全覆盖、内存管理等、可以扩展至C++11/17）
-* 操作系统（线程、进程、锁、还有大量的 I/O 系统调用及其封装还有 EPOLL 等多路复用机制）
-* 网络（网络编程，通信，网络异常的处理）
-* 数据库（注册中心的数据库语句、负载均衡等）
-* 还有设计模式、缓存设计，日志系统，定时器模块等等
+```bash
+# 1. 构建（需要 cmake >= 3.5、支持 C++17 的 g++）
+cmake -S . -B build -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+cmake --build build -j4
 
-**大家背的八股，无非就是 网络，操作系统和数据库，还有C++八股，webserver基本都包含了**，**webserver是八股结合实战非常好的案例**！
+# 2. 一键启动全链路（网关 + 模型守护进程）
+./scripts/run_local_model_stack.sh
 
-可以理解成：**webserver 就是大家背的八股的实战篇**。
+# 无 GPU / 不加载模型，先验证链路：
+MOCK_BACKEND=1 ./scripts/run_local_model_stack.sh
+```
 
-webserver 也可以称之为高性能服务器，因为他算是服务器开发，不少录友在简历上不写webserver这个名字，而写的是高性能服务器。
+验证接口（与调 OpenAI 官方 API 姿势完全一致）：
 
-换一个名字好像高级了一些。。。
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"local","messages":[{"role":"user","content":"你好"}],"max_tokens":64}'
+```
 
-如果你时间充裕，想系统学习C++，做webserver是非常好的选择，你会发现自己背的八股都活学活用了。
+LangChain 接入：
 
-当然，简历上一个webserver 是不够的，还需要再做一个项目。 [知识星球](https://programmercarl.com/other/kstar.html)里有众多项目可以选：
+```python
+from langchain_openai import ChatOpenAI
+llm = ChatOpenAI(base_url="http://127.0.0.1:8080/v1", api_key="sk-local", model="local")
+```
 
-如果你时间紧张，那就别做webserver了，本来形式就是“烂大街”的。
+RAG 建库与问答见 [rag/RAG.md](rag/RAG.md)。
 
-webserver是用来打基础的，也没时间打基础，就把相关八股背一背，突击做一些新颖一些的项目。[知识星球](https://programmercarl.com/other/kstar.html)里目前有10个C++的项目可以选择。
+## 目录结构
 
-## 高性能服务器项目第二版
+```
+src/        网络框架实现 + main.cc（网关逻辑：HTTP/行协议解析、worker 队列、SSE）
+include/    公共头文件
+log/        异步日志组件（liblog_lib）
+memory/     内存池组件（libmemory_lib）
+model_daemon.py  推理守护进程（vLLM / Transformers / Mock 可插拔 Backend）
+rag/        LangChain RAG：建库脚本、问答脚本、示例语料
+scripts/    一键启动脚本
+webui_proxy.py   轻量浏览器聊天 UI（http://127.0.0.1:7860）
+```
 
+## 设计要点
 
-文档方面，相对与[第一版](https://mp.weixin.qq.com/s/40ISnd7PkBtAlWv5MQf1vQ) 做了如下优化：
+- **协议兼容优先**：对外表现为标准 OpenAI endpoint，任何生态工具（LangChain / LlamaIndex / openai SDK / curl）零改造接入
+- **事件循环零阻塞**：LLM 推理耗时可达秒级，绝不放在 event-loop 线程执行，统一投递到推理 worker 队列，回写时经 `runInLoop` 回到连接所属线程
+- **推理后端可插拔**：`Backend` 抽象基类隔离网关协议与模型实现，加新后端（Ollama、云端 API）只需实现 `infer()`
+- **本地闭环**：语料、向量库、模型、网关全部在本机，适合对隐私敏感的私有知识问答场景
 
-1、开篇：讲述了为什么要学习webserver，以及学习webserver需要什么基础知识。
+## 开发状态
 
-2、大纲：讲述了整个文章的框架结构。
+- [x] OpenAI 兼容 chat 接口 + SSE 流式
+- [x] Transformers / vLLM / Mock 三种推理后端
+- [x] LangChain RAG 建库与问答脚本
+- [ ] `/v1/embeddings` 端点（当前 embedding 由 Python 侧本地完成）
+- [ ] `/v1/models` 探活端点
+- [ ] 网关层 LFU 响应缓存接入
+- [ ] RAG 全链路端到端测试
 
-3、框架梳理：讲述了webserver整体的架构如网络模块、定时器模块、内存池、LFU、日志系统等。
+## 许可证
 
-4、代码模块：讲述了上面提到模块以及内存池、LFU的核心代码部分。
-
-5、面试问题：整理了星球录友亲身经历的问题
-
-6、补充简历写法。
-
-## 高性能服务器专栏
-
-该项目的专栏是[知识星球](https://programmercarl.com/other/kstar.html)录友专享的。
-
-项目专栏依然是将 「简历写法」给大家列出来了，大家学完就可以参考这个来写简历：
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250307105143.png' width=500 alt=''></img></div>
-
-做完该项目，面试中大概率会有哪些面试问题，以及如何回答，也列出好了：
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250307105324.png' width=500 alt=''></img></div>
-
-专栏中的项目面试题都掌握的话，这个项目在面试中基本没问题。
-
-很多录友在做项目的时候，把项目运行起来 就是第一大难点！
-
-本项目运行起来 需要依赖的环境很多，所以我给大家准备的 自动化环境配置脚本， **项目运行环境，一键配置！ 不需要大家去处理环境问题了**：
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250307105632.png' width=500 alt=''></img></div>
-
-
-框架梳理：
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250307105726.png' width=500 alt=''></img></div>
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250307105931.png' width=500 alt=''></img></div>
-
-底层网络模块架构：
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250307105758.png' width=500 alt=''></img></div>
-
-代码讲解：
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250307110003.png' width=500 alt=''></img></div>
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250307110035.png' width=500 alt=''></img></div>
-
-日志系统的设计：
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250307110057.png' width=500 alt=''></img></div>
-
-缓冲区的设计：
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250307110130.png' width=500 alt=''></img></div>
-
-内存管理设计：
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250307110205.png' width=500 alt=''></img></div>
-
-线程池：
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250307110234.png' width=500 alt=''></img></div>
-
-## 答疑
-
-本项目在[知识星球](https://programmercarl.com/other/kstar.html)里为 文字专栏形式，大家不用担心，看不懂，星球里每个项目有专属答疑群，任何问题都可以在群里问，都会得到解答：
-
-![](https://file1.kamacoder.com/i/web/2025-09-26_11-30-13.jpg)
-
-
-
-## 下载方式
-
-**本文档仅为星球内部专享，大家可以加入[知识星球](https://programmercarl.com/other/kstar.html)里获取，在星球置顶一**
-
+GPL-3.0，详见 [LICENSE](LICENSE)。
